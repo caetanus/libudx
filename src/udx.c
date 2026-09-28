@@ -40,6 +40,10 @@
 #define UDX_MAX_RTO_TIMEOUTS 6
 
 #define UDX_RTO_MAX_MS        30000
+// Delayed ack: one ack per two in-order data packets, a lone one acked within
+// UDX_DELACK_MS. Kept short so the added latency is negligible while still
+// coalescing at the packet rates where ack overhead actually costs anything.
+#define UDX_DELACK_MS         2
 #define UDX_RTT_MAX_MS        30000
 #define UDX_RTT_MIN_WINDOW_MS 300000            // 300 seconds, same as Linux default
 #define UDX_DEFAULT_RWND_MAX  (4 * 1024 * 1024) // arbitrary, ~175 1500 mtu packets, @20ms latency = 416 mbits/sec
@@ -467,9 +471,11 @@ close_stream_internal (udx_stream_t *stream, int err) {
 
   uv_timer_stop(&stream->timer);
   uv_timer_stop(&stream->refill_pacing_timer);
+  uv_timer_stop(&stream->delack_timer);
 
   uv_close((uv_handle_t *) &stream->timer, finalize_maybe);
   uv_close((uv_handle_t *) &stream->refill_pacing_timer, finalize_maybe);
+  uv_close((uv_handle_t *) &stream->delack_timer, finalize_maybe);
   uv_close((uv_handle_t *) &stream->pending_packet_prepare, finalize_maybe);
 
   if (udx->teardown && socket != NULL && socket->streams == NULL) {
@@ -562,6 +568,13 @@ send_ack (udx_stream_t *stream) {
     stream->ack_needed = true; // defer until we are connected
     return;
   }
+
+  // this ack covers whatever a delayed one was still waiting for
+  if (stream->delack_pending) {
+    stream->delack_pending = 0;
+    uv_timer_stop(&stream->delack_timer);
+  }
+
   // todo: if data is available for writing then write a data + ack packet
 
   struct {
@@ -627,6 +640,13 @@ send_ack (udx_stream_t *stream) {
     assert(stream->write_queue.len == 0);
     close_stream(stream, 0);
   }
+}
+
+// the delayed ack fired: a lone in-order data packet waited UDX_DELACK_MS
+static void
+on_delack_timeout (uv_timer_t *timer) {
+  udx_stream_t *stream = timer->data;
+  if (stream->delack_pending) send_ack(stream);
 }
 
 static bool
@@ -1778,7 +1798,16 @@ process_packet (udx_socket_t *socket, char *buf, ssize_t buf_len, struct sockadd
   }
 
   if (type & UDX_HEADER_DATA_OR_END) {
-    send_ack(stream);
+    // Ack at once for the end of the stream, while a gap is open (the sender's
+    // fast recovery is driven by those acks), and for every second in-order
+    // packet; otherwise wait UDX_DELACK_MS for a second one to coalesce with.
+    bool gap_open = stream->sack_tree.root != stream->sack_tree.sentinel;
+    if ((type & UDX_HEADER_END) || gap_open || stream->delack_pending >= 1) {
+      send_ack(stream);
+    } else {
+      stream->delack_pending++;
+      uv_timer_start(&stream->delack_timer, on_delack_timeout, UDX_DELACK_MS, 0);
+    }
     if (stream->status & UDX_STREAM_DEAD) {
       return 1;
     }
@@ -2340,7 +2369,11 @@ udx_stream_init (udx_t *udx, udx_stream_t *stream, uint32_t local_id, udx_stream
   uv_timer_init(udx->loop, &stream->refill_pacing_timer);
   stream->refill_pacing_timer.data = stream;
 
-  stream->nrefs = 3; // timer, refill_pacing_timer, pending_packet_prepare
+  uv_timer_init(udx->loop, &stream->delack_timer);
+  stream->delack_timer.data = stream;
+  stream->delack_pending = 0;
+
+  stream->nrefs = 4; // timer, refill_pacing_timer, delack_timer, pending_packet_prepare
 
   udx__queue_init(&stream->inflight_queue);
   udx__queue_init(&stream->retransmit_queue);
